@@ -1,0 +1,40 @@
+{
+  "name": "pi-notify",
+  "version": "0.1.0",
+  "description": "ORGM Pi notify package.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/osmargm1202/pi-notify.git"
+  },
+  "bugs": {
+    "url": "https://github.com/osmargm1202/pi-notify/issues"
+  },
+  "homepage": "https://github.com/osmargm1202/pi-notify#readme",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "orgm",
+    "notify"
+  ],
+  "files": [
+    "extensions",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.*",
+    "pack:check": "npm pack --dry-run"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/notify.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.79.0"
+  }
+}
