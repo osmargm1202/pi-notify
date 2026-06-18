@@ -21,12 +21,22 @@ const KITTY_DESKTOP_ENTRY = "kitty";
 
 type NotificationType = "question" | "permission" | "done";
 
-type NotifyCommand = {
-	command: string;
-	argsPrefix: string[];
-};
+type NotifyFn = (title: string, body: string, hints: string[]) => void;
 
-let notifyCommandCache: NotifyCommand | null | undefined;
+let notifyFnCache: NotifyFn | null | undefined;
+
+export function _resetCache(): void {
+	notifyFnCache = undefined;
+}
+
+// Override process.platform in tests (e.g. "_NOTIFY_PLATFORM=darwin").
+function currentPlatform(): string {
+	return process.env._NOTIFY_PLATFORM ?? process.platform;
+}
+
+function isMacOS(): boolean {
+	return currentPlatform() === "darwin";
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
@@ -96,6 +106,10 @@ function isDistroboxRuntime(): boolean {
 	);
 }
 
+function isWSLRuntime(): boolean {
+	return Boolean(process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP);
+}
+
 function isSubagentRuntime(): boolean {
 	if (process.env.PI_PDD_SUBAGENT === "1") return true;
 	if (process.env.PI_SUBAGENT_RUNTIME_ID?.trim()) return true;
@@ -134,28 +148,100 @@ function hostNotifySendExists(): boolean {
 	}
 }
 
-function resolveNotifyCommand(): NotifyCommand | null {
-	if (notifyCommandCache !== undefined) return notifyCommandCache;
+function spawnFire(command: string, args: string[]): void {
+	const child = spawn(command, args, { detached: true, stdio: "ignore" });
+	child.on("error", () => undefined);
+	child.unref();
+}
+
+function makeNotifySendFn(command: string, prefix: string[]): NotifyFn {
+	return (title, body, hints) => {
+		spawnFire(command, [
+			...prefix,
+			"-a", "Pi",
+			"-u", "normal",
+			"-e",
+			"-t", String(AUTO_DISMISS_TIMEOUT_MS),
+			...hints,
+			title,
+			body,
+		]);
+	};
+}
+
+function makeOsascriptFn(): NotifyFn {
+	return (title, body) => {
+		const safeTitle = title.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+		const safeBody = body.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+		spawnFire("osascript", [
+			"-e",
+			`display notification "${safeBody}" with title "${safeTitle}"`,
+		]);
+	};
+}
+
+function xmlEscape(text: string): string {
+	return text
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;");
+}
+
+function psEscape(text: string): string {
+	return text.replace(/'/g, "''");
+}
+
+function makeWSLFn(): NotifyFn {
+	return (title, body) => {
+		const safeTitle = psEscape(xmlEscape(title));
+		const safeBody = psEscape(xmlEscape(body));
+		const xml = `<toast><visual><binding template="ToastGeneric"><text>${safeTitle}</text><text>${safeBody}</text></binding></visual></toast>`;
+		const script = [
+			"$ErrorActionPreference = 'SilentlyContinue'",
+			"[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null",
+			"$t = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Pi')",
+			"$x = New-Object Windows.Data.Xml.Dom.XmlDocument",
+			`$x.LoadXml('${xml}')`,
+			"$t.Show([Windows.UI.Notifications.ToastNotification]::new($x))",
+		].join("; ");
+		spawnFire("powershell.exe", [
+			"-NoProfile",
+			"-NonInteractive",
+			"-WindowStyle", "Hidden",
+			"-Command", script,
+		]);
+	};
+}
+
+function resolveNotifyFn(): NotifyFn | null {
+	if (notifyFnCache !== undefined) return notifyFnCache;
+
+	if (isMacOS()) {
+		notifyFnCache = commandExists("osascript") ? makeOsascriptFn() : null;
+		return notifyFnCache;
+	}
+
+	if (isWSLRuntime()) {
+		notifyFnCache = commandExists("powershell.exe") ? makeWSLFn() : null;
+		return notifyFnCache;
+	}
 
 	if (
 		isDistroboxRuntime() &&
 		commandExists("distrobox-host-exec") &&
 		hostNotifySendExists()
 	) {
-		notifyCommandCache = {
-			command: "distrobox-host-exec",
-			argsPrefix: ["notify-send"],
-		};
-		return notifyCommandCache;
+		notifyFnCache = makeNotifySendFn("distrobox-host-exec", ["notify-send"]);
+		return notifyFnCache;
 	}
 
 	if (commandExists("notify-send")) {
-		notifyCommandCache = { command: "notify-send", argsPrefix: [] };
-		return notifyCommandCache;
+		notifyFnCache = makeNotifySendFn("notify-send", []);
+		return notifyFnCache;
 	}
 
-	notifyCommandCache = null;
-	return notifyCommandCache;
+	notifyFnCache = null;
+	return notifyFnCache;
 }
 
 function notify(
@@ -164,32 +250,13 @@ function notify(
 	text: string,
 ): void {
 	try {
-		const notifyCommand = resolveNotifyCommand();
-		if (!notifyCommand) return;
+		const notifyFn = resolveNotifyFn();
+		if (!notifyFn) return;
 
 		const folder = folderName(ctx.cwd);
 		const title = `Pi ${type} · ${folder}`;
 		const body = truncate(`${folder} · ${type} · ${text}`);
-		const args = [
-			...notifyCommand.argsPrefix,
-			"-a",
-			"Pi",
-			"-u",
-			"normal",
-			"-e",
-			"-t",
-			String(AUTO_DISMISS_TIMEOUT_MS),
-			...getNotificationHints(),
-			title,
-			body,
-		];
-
-		const child = spawn(notifyCommand.command, args, {
-			detached: true,
-			stdio: "ignore",
-		});
-		child.on("error", () => undefined);
-		child.unref();
+		notifyFn(title, body, getNotificationHints());
 	} catch {
 		// Notifications must never affect Pi tool execution.
 	}

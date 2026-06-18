@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import notifyExtension from "../extensions/notify.ts";
+import notifyExtension, { _resetCache } from "../extensions/notify.ts";
 
 type Handler = (event: any, ctx: any) => unknown | Promise<unknown>;
 
@@ -12,24 +12,40 @@ type SubagentEnv = {
 	PI_SUBAGENT_RUNTIME_DEPTH?: string;
 };
 
-const tempDir = mkdtempSync(join(tmpdir(), "pi-notify-test-"));
-const logPath = join(tempDir, "notify.log");
-const fakeDistroboxHostExec = join(tempDir, "distrobox-host-exec");
+// --- fake binaries: one dir per backend so PATH is controlled per test ---
 
-writeFileSync(
-	fakeDistroboxHostExec,
-	`#!/usr/bin/env bash
-printf '%q ' "$@" >> ${JSON.stringify(logPath)}
-printf '\n' >> ${JSON.stringify(logPath)}
-exit 0
-`,
-);
-chmodSync(fakeDistroboxHostExec, 0o755);
+const originalPATH = process.env.PATH ?? "";
+
+function makeBinDir(name: string, scriptBody: string): string {
+	const dir = mkdtempSync(join(tmpdir(), `pi-notify-${name}-`));
+	const binPath = join(dir, name);
+	writeFileSync(binPath, `#!/usr/bin/env bash\n${scriptBody}\n`);
+	chmodSync(binPath, 0o755);
+	return dir;
+}
+
+const logPath = join(mkdtempSync(join(tmpdir(), "pi-notify-log-")), "notify.log");
 writeFileSync(logPath, "");
 
-process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
-process.env.container = "podman";
-process.env.KITTY_PID = "12345";
+function logScript(cmdName: string): string {
+	const log = JSON.stringify(logPath);
+	const lines = [
+		cmdName ? `printf '%s ' ${JSON.stringify(cmdName)} >> ${log}` : "",
+		`printf '%q ' "$@" >> ${log}`,
+		`printf '\\n' >> ${log}`,
+		"exit 0",
+	].filter(Boolean);
+	return lines.join("\n");
+}
+
+// distrobox-host-exec logs its own args (first arg will be "notify-send")
+const distroboxDir = makeBinDir("distrobox-host-exec", logScript(""));
+// osascript logs itself with prefix
+const macosDir = makeBinDir("osascript", logScript("osascript "));
+// powershell.exe logs itself with prefix
+const wslDir = makeBinDir("powershell.exe", logScript("powershell.exe "));
+
+// --- handler registration (handlers are platform-agnostic) ---
 
 const handlers = new Map<string, Handler[]>();
 notifyExtension({
@@ -38,44 +54,36 @@ notifyExtension({
 	},
 } as any);
 
+// --- helpers ---
+
 function resetLog(): void {
 	writeFileSync(logPath, "");
 }
 
-function readNotificationLog(): string {
+function readLog(): string {
 	return readFileSync(logPath, "utf8");
 }
 
-function countNotificationLines(log: string): number {
+function countLines(log: string, prefix: string): number {
 	return log
 		.trim()
 		.split("\n")
-		.filter((line) => line.startsWith("notify-send -a Pi")).length;
+		.filter((line) => line.startsWith(prefix)).length;
 }
 
-async function waitForNotificationLines(
-	expectedCount: number,
-	options: { timeoutMs?: number; intervalMs?: number } = {},
-): Promise<string> {
-	const timeoutMs = options.timeoutMs ?? 1_500;
-	const intervalMs = options.intervalMs ?? 25;
+async function waitForLines(prefix: string, expectedCount: number, timeoutMs = 1_500): Promise<string> {
 	const deadline = Date.now() + timeoutMs;
-	let log = readNotificationLog();
-
-	while (countNotificationLines(log) < expectedCount && Date.now() < deadline) {
-		await new Promise((resolve) => setTimeout(resolve, intervalMs));
-		log = readNotificationLog();
+	let log = readLog();
+	while (countLines(log, prefix) < expectedCount && Date.now() < deadline) {
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		log = readLog();
 	}
-
 	return log;
 }
 
-async function waitForQuietNotifications(
-	options: { settleMs?: number } = {},
-): Promise<string> {
-	const settleMs = options.settleMs ?? 150;
+async function waitForQuiet(settleMs = 150): Promise<string> {
 	await new Promise((resolve) => setTimeout(resolve, settleMs));
-	return readNotificationLog();
+	return readLog();
 }
 
 async function emitToolCalls(): Promise<void> {
@@ -105,40 +113,109 @@ async function emitAgentEnd(): Promise<void> {
 }
 
 function setSubagentEnv(env: SubagentEnv): void {
-	for (const key of [
-		"PI_PDD_SUBAGENT",
-		"PI_SUBAGENT_RUNTIME_ID",
-		"PI_SUBAGENT_RUNTIME_DEPTH",
-	] as const) {
+	for (const key of ["PI_PDD_SUBAGENT", "PI_SUBAGENT_RUNTIME_ID", "PI_SUBAGENT_RUNTIME_DEPTH"] as const) {
 		const value = env[key];
 		if (value === undefined) delete process.env[key];
 		else process.env[key] = value;
 	}
 }
 
-async function main(): Promise<void> {
+function setBackend(backend: "distrobox" | "macos" | "wsl"): void {
+	// clear all backend env
+	delete process.env.container;
+	delete process.env.DISTROBOX_ENTER_PATH;
+	delete process.env.DISTROBOX_HOST_HOME;
+	delete process.env.WSL_DISTRO_NAME;
+	delete process.env.WSL_INTEROP;
+	delete process.env.KITTY_PID;
+	delete process.env.KITTY_WINDOW_ID;
+	delete process.env._NOTIFY_PLATFORM;
+
+	if (backend === "distrobox") {
+		process.env.container = "podman";
+		process.env.KITTY_PID = "12345";
+		process.env.PATH = `${distroboxDir}:${originalPATH}`;
+	} else if (backend === "macos") {
+		// isMacOS() checks _NOTIFY_PLATFORM so platform-specific branches work without relying on PATH tricks.
+		process.env._NOTIFY_PLATFORM = "darwin";
+		process.env.PATH = `${macosDir}:${originalPATH}`;
+	} else if (backend === "wsl") {
+		process.env.WSL_DISTRO_NAME = "Ubuntu";
+		process.env.PATH = `${wslDir}:${originalPATH}`;
+	}
+
+	_resetCache();
+}
+
+// --- tests ---
+
+async function testDistroboxLinuxBackend(): Promise<void> {
+	setBackend("distrobox");
 	resetLog();
 	setSubagentEnv({});
+
 	await emitToolCalls();
 	await emitAgentEnd();
 
-	const mainLog = await waitForNotificationLines(3);
-	const mainNotificationLines = mainLog
-		.trim()
-		.split("\n")
-		.filter((line) => line.startsWith("notify-send -a Pi"));
-	assert.equal(mainNotificationLines.length, 3, "questions, permissions, and main agent completion should notify");
-	assert.match(mainLog, /notify-send/, "notifications should call notify-send through distrobox-host-exec");
-	assert.match(mainLog, /-u normal/, "notifications should use normal urgency so daemons respect auto-dismiss");
-	assert.doesNotMatch(mainLog, /-u critical/, "notifications must not be critical because critical notifications can stay pinned");
-	assert.match(mainLog, /-e/, "notifications should be transient instead of persistent history entries");
-	assert.match(mainLog, /-t 8000(\s|$)/, "notifications should auto-dismiss after exactly 8 seconds");
-	assert.doesNotMatch(mainLog, /-t 0(\s|$)/, "notifications should not be sticky forever");
-	assert.match(mainLog, /Pi\\ question/, "ask_user_question should send a question notification");
-	assert.match(mainLog, /Pi\\ permission/, "permission prompts should send a permission notification");
-	assert.match(mainLog, /Pi\\ done/, "agent_end should send a final loop completion notification for main agent");
-	assert.doesNotMatch(mainLog, /finished/, "agent_end assistant text should not notify");
-	assert.doesNotMatch(mainLog, /bash/, "ordinary tool calls should not notify");
+	const log = await waitForLines("notify-send -a Pi", 3);
+	const lines = log.trim().split("\n").filter((l) => l.startsWith("notify-send -a Pi"));
+	assert.equal(lines.length, 3, "distrobox: question + permission + done should notify");
+	assert.match(log, /-u normal/, "distrobox: urgency must be normal");
+	assert.doesNotMatch(log, /-u critical/, "distrobox: must not be critical");
+	assert.match(log, /-e/, "distrobox: must be transient");
+	assert.match(log, /-t 8000(\s|$)/, "distrobox: must auto-dismiss after 8s");
+	assert.match(log, /Pi\\ question/, "distrobox: ask_user_question triggers question notification");
+	assert.match(log, /Pi\\ permission/, "distrobox: permission prompt triggers permission notification");
+	assert.match(log, /Pi\\ done/, "distrobox: agent_end triggers done notification");
+	assert.doesNotMatch(log, /finished/, "distrobox: agent text must not appear");
+	assert.doesNotMatch(log, /bash/, "distrobox: plain tool calls must not notify");
+}
+
+async function testMacOSBackend(): Promise<void> {
+	setBackend("macos");
+	resetLog();
+	setSubagentEnv({});
+
+	await emitToolCalls();
+	await emitAgentEnd();
+
+	const log = await waitForLines("osascript ", 3);
+	const lines = log.trim().split("\n").filter((l) => l.startsWith("osascript "));
+	assert.equal(lines.length, 3, "macos: question + permission + done should notify via osascript");
+	assert.match(log, /osascript/, "macos: must invoke osascript");
+	assert.match(log, /-e/, "macos: must pass -e flag to osascript");
+	assert.match(log, /display/, "macos: osascript script must contain display");
+	assert.match(log, /notification/, "macos: osascript script must contain notification");
+	assert.match(log, /title/, "macos: osascript script must contain title");
+	assert.match(log, /question/, "macos: ask_user_question triggers notification");
+	assert.match(log, /permission/, "macos: permission prompt triggers notification");
+	assert.match(log, /done/, "macos: agent_end triggers notification");
+	assert.doesNotMatch(log, /finished/, "macos: agent text must not appear");
+	assert.doesNotMatch(log, /bash/, "macos: plain tool calls must not notify");
+}
+
+async function testWSLBackend(): Promise<void> {
+	setBackend("wsl");
+	resetLog();
+	setSubagentEnv({});
+
+	await emitToolCalls();
+	await emitAgentEnd();
+
+	const log = await waitForLines("powershell.exe ", 3);
+	const lines = log.trim().split("\n").filter((l) => l.startsWith("powershell.exe "));
+	assert.equal(lines.length, 3, "wsl: question + permission + done should notify via powershell.exe");
+	assert.match(log, /-NoProfile/, "wsl: must run with -NoProfile");
+	assert.match(log, /ToastNotif/, "wsl: must use Windows toast notification API");
+	assert.match(log, /question/, "wsl: ask_user_question triggers notification");
+	assert.match(log, /permission/, "wsl: permission prompt triggers notification");
+	assert.match(log, /done/, "wsl: agent_end triggers notification");
+	assert.doesNotMatch(log, /finished/, "wsl: agent text must not appear");
+	assert.doesNotMatch(log, /bash/, "wsl: plain tool calls must not notify");
+}
+
+async function testSubagentSilence(): Promise<void> {
+	setBackend("distrobox");
 
 	for (const env of [
 		{ PI_PDD_SUBAGENT: "1" },
@@ -148,17 +225,24 @@ async function main(): Promise<void> {
 		resetLog();
 		setSubagentEnv(env);
 		await emitAgentEnd();
-		const subagentLog = await waitForQuietNotifications();
-		const subagentNotificationLines = subagentLog
-			.trim()
-			.split("\n")
-			.filter((line) => line.startsWith("notify-send -a Pi"));
-		assert.equal(subagentNotificationLines.length, 0, `subagent agent_end should stay quiet for ${JSON.stringify(env)}`);
-		assert.doesNotMatch(subagentLog, /Pi\\ done/, "subagent completion should not send done notification");
-		assert.doesNotMatch(subagentLog, /finished/, "subagent agent_end should not leak assistant text");
+		const log = await waitForQuiet();
+		assert.equal(
+			log.trim().split("\n").filter((l) => l.startsWith("notify-send -a Pi")).length,
+			0,
+			`subagent: agent_end must stay quiet for ${JSON.stringify(env)}`,
+		);
+		assert.doesNotMatch(log, /Pi\\ done/, "subagent: done notification must not fire");
+		assert.doesNotMatch(log, /finished/, "subagent: agent text must not leak");
 	}
 
 	setSubagentEnv({});
+}
+
+async function main(): Promise<void> {
+	await testDistroboxLinuxBackend();
+	await testMacOSBackend();
+	await testWSLBackend();
+	await testSubagentSilence();
 }
 
 main().catch((error) => {
