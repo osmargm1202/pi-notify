@@ -32,8 +32,6 @@ const FEATURE_ALIASES = new Map<string, string>([
 
 export const KNOWN_ORGM_EXTENSION_FEATURES: Record<string, string[]> = {
 	ask: ["questions", "permissions"],
-	ask_user_question: ["questions"],
-	ask_user_permission: ["permissions"],
 	askAsk: ["questions", "permissions"],
 	ask_ask: ["questions", "permissions"],
 	askUser: ["questions", "permissions"],

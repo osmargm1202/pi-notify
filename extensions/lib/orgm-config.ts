@@ -203,7 +203,7 @@ export function mergeAgentModelsConfig(value: unknown): OrgmAgentModelsConfig {
 	if (!isRecord(value)) return { ...DEFAULT_ORGM_CONFIG.agentModels };
 	return Object.fromEntries(
 		Object.entries(value)
-			.filter(([agentName, model]) => agentName.trim().length > 0 && typeof model === "string" && model.trim().length > 0)
+			.filter((entry): entry is [string, string] => entry[0].trim().length > 0 && typeof entry[1] === "string" && entry[1].trim().length > 0)
 			.map(([agentName, model]) => [agentName.trim(), model.trim()]),
 	);
 }
@@ -230,7 +230,7 @@ function preserveUnknownTopLevelValues(raw: Record<string, unknown>): Record<str
 function mergeOrgmConfig(raw: Record<string, unknown>): OrgmHostConfig {
 	const unknownTopLevel = preserveUnknownTopLevelValues(raw);
 	return {
-		...(unknownTopLevel as OrgmHostConfig),
+		...unknownTopLevel,
 		mode: mergeModeConfig(raw.mode),
 		git: mergeGitConfig(raw.git),
 		title: mergeTitleConfig(raw.title),

@@ -1,5 +1,7 @@
-import { spawn, spawnSync } from "node:child_process";
-import { basename } from "node:path";
+import { spawnSync } from "node:child_process";
+import { platform } from "node:os";
+import { basename, win32 } from "node:path";
+import { createNotificationProcesses, type NotificationSpawn } from "./lib/notification-process.ts";
 import { isOrgmExtensionEnabled } from "./lib/orgm-extension-config.ts";
 import type {
 	ExtensionAPI,
@@ -21,22 +23,7 @@ const KITTY_DESKTOP_ENTRY = "kitty";
 
 type NotificationType = "question" | "permission" | "done";
 
-type NotifyFn = (title: string, body: string, hints: string[]) => void;
-
-let notifyFnCache: NotifyFn | null | undefined;
-
-export function _resetCache(): void {
-	notifyFnCache = undefined;
-}
-
-// Override process.platform in tests (e.g. "_NOTIFY_PLATFORM=darwin").
-function currentPlatform(): string {
-	return process.env._NOTIFY_PLATFORM ?? process.platform;
-}
-
-function isMacOS(): boolean {
-	return currentPlatform() === "darwin";
-}
+type NotifyFn = (title: string, body: string, hints: string[], signal?: AbortSignal) => void;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
@@ -54,7 +41,7 @@ function truncate(text: string, maxLength = MAX_BODY_LENGTH): string {
 
 function folderName(cwd: string): string {
 	const trimmed = cwd.replace(/[\\/]+$/, "");
-	return basename(trimmed) || trimmed || ".";
+	return (trimmed.includes("\\") ? win32.basename(trimmed) : basename(trimmed)) || trimmed || ".";
 }
 
 function isPositiveInteger(value: string | undefined): value is string {
@@ -123,12 +110,12 @@ function isSubagentRuntime(): boolean {
 
 function commandExists(command: string): boolean {
 	try {
-		return (
-			spawnSync("sh", ["-lc", `command -v ${command} >/dev/null 2>&1`], {
-				stdio: "ignore",
-				timeout: 500,
-			}).status === 0
-		);
+		const windows = platform() === "win32";
+		return spawnSync(
+			windows ? "where.exe" : "sh",
+			windows ? [command] : ["-c", `command -v ${command} >/dev/null 2>&1`],
+			{ stdio: "ignore", timeout: 500 },
+		).status === 0;
 	} catch {
 		return false;
 	}
@@ -139,7 +126,7 @@ function hostNotifySendExists(): boolean {
 		return (
 			spawnSync(
 				"distrobox-host-exec",
-				["sh", "-lc", "command -v notify-send >/dev/null 2>&1"],
+				["sh", "-c", "command -v notify-send >/dev/null 2>&1"],
 				{ stdio: "ignore", timeout: 1000 },
 			).status === 0
 		);
@@ -148,14 +135,8 @@ function hostNotifySendExists(): boolean {
 	}
 }
 
-function spawnFire(command: string, args: string[]): void {
-	const child = spawn(command, args, { detached: true, stdio: "ignore" });
-	child.on("error", () => undefined);
-	child.unref();
-}
-
-function makeNotifySendFn(command: string, prefix: string[]): NotifyFn {
-	return (title, body, hints) => {
+function makeNotifySendFn(spawnFire: NotificationSpawn, command: string, prefix: string[]): NotifyFn {
+	return (title, body, hints, signal) => {
 		spawnFire(command, [
 			...prefix,
 			"-a", "Pi",
@@ -163,20 +144,19 @@ function makeNotifySendFn(command: string, prefix: string[]): NotifyFn {
 			"-e",
 			"-t", String(AUTO_DISMISS_TIMEOUT_MS),
 			...hints,
-			title,
-			body,
-		]);
+			"--", title, body,
+		], signal);
 	};
 }
 
-function makeOsascriptFn(): NotifyFn {
-	return (title, body) => {
+function makeOsascriptFn(spawnFire: NotificationSpawn): NotifyFn {
+	return (title, body, _hints, signal) => {
 		const safeTitle = title.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 		const safeBody = body.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 		spawnFire("osascript", [
 			"-e",
 			`display notification "${safeBody}" with title "${safeTitle}"`,
-		]);
+		], signal);
 	};
 }
 
@@ -191,8 +171,8 @@ function psEscape(text: string): string {
 	return text.replace(/'/g, "''");
 }
 
-function makeWSLFn(): NotifyFn {
-	return (title, body) => {
+function makeWindowsFn(spawnFire: NotificationSpawn): NotifyFn {
+	return (title, body, _hints, signal) => {
 		const safeTitle = psEscape(xmlEscape(title));
 		const safeBody = psEscape(xmlEscape(body));
 		const xml = `<toast><visual><binding template="ToastGeneric"><text>${safeTitle}</text><text>${safeBody}</text></binding></visual></toast>`;
@@ -208,22 +188,18 @@ function makeWSLFn(): NotifyFn {
 			"-NoProfile",
 			"-NonInteractive",
 			"-WindowStyle", "Hidden",
-			"-Command", script,
-		]);
+			"-EncodedCommand", Buffer.from(script, "utf16le").toString("base64"),
+		], signal);
 	};
 }
 
-function resolveNotifyFn(): NotifyFn | null {
-	if (notifyFnCache !== undefined) return notifyFnCache;
-
-	if (isMacOS()) {
-		notifyFnCache = commandExists("osascript") ? makeOsascriptFn() : null;
-		return notifyFnCache;
+function resolveNotifyFn(spawnFire: NotificationSpawn): NotifyFn | null {
+	if (platform() === "darwin") {
+		return commandExists("osascript") ? makeOsascriptFn(spawnFire) : null;
 	}
 
-	if (isWSLRuntime()) {
-		notifyFnCache = commandExists("powershell.exe") ? makeWSLFn() : null;
-		return notifyFnCache;
+	if (platform() === "win32" || isWSLRuntime()) {
+		return commandExists("powershell.exe") ? makeWindowsFn(spawnFire) : null;
 	}
 
 	if (
@@ -231,35 +207,39 @@ function resolveNotifyFn(): NotifyFn | null {
 		commandExists("distrobox-host-exec") &&
 		hostNotifySendExists()
 	) {
-		notifyFnCache = makeNotifySendFn("distrobox-host-exec", ["notify-send"]);
-		return notifyFnCache;
+		return makeNotifySendFn(spawnFire, "distrobox-host-exec", ["notify-send"]);
 	}
 
 	if (commandExists("notify-send")) {
-		notifyFnCache = makeNotifySendFn("notify-send", []);
-		return notifyFnCache;
+		return makeNotifySendFn(spawnFire, "notify-send", []);
 	}
 
-	notifyFnCache = null;
-	return notifyFnCache;
+	return null;
 }
 
-function notify(
-	type: NotificationType,
-	ctx: ExtensionContext,
-	text: string,
-): void {
-	try {
-		const notifyFn = resolveNotifyFn();
-		if (!notifyFn) return;
-
-		const folder = folderName(ctx.cwd);
-		const title = `Pi ${type} · ${folder}`;
-		const body = truncate(`${folder} · ${type} · ${text}`);
-		notifyFn(title, body, getNotificationHints());
-	} catch {
-		// Notifications must never affect Pi tool execution.
-	}
+function createNotifier() {
+	const processes = createNotificationProcesses();
+	let notifyFn: NotifyFn | null | undefined;
+	let closed = false;
+	return {
+		notify(type: NotificationType, ctx: ExtensionContext, text: string): void {
+			if (closed || ctx.signal?.aborted) return;
+			try {
+				if (notifyFn === undefined) notifyFn = resolveNotifyFn(processes.spawn);
+				if (!notifyFn) return;
+				const folder = cleanText(folderName(ctx.cwd));
+				const title = `Pi ${type} · ${folder}`;
+				const body = truncate(`${folder} · ${type} · ${text}`);
+				notifyFn(title, body, getNotificationHints(), ctx.signal);
+			} catch {
+				// Notifications must never affect Pi tool execution.
+			}
+		},
+		shutdown() {
+			closed = true;
+			processes.shutdown();
+		},
+	};
 }
 
 function getStringField(
@@ -280,9 +260,10 @@ function isPermissionToolName(toolName: string): boolean {
 
 function getQuestionText(event: ToolCallEvent): string {
 	const fallback = "Pi is waiting for your answer.";
-	if (!isRecord(event.input)) return fallback;
+	const input: unknown = event.input;
+	if (!isRecord(input)) return fallback;
 
-	const direct = getStringField(event.input, [
+	const direct = getStringField(input, [
 		"question",
 		"prompt",
 		"message",
@@ -290,7 +271,7 @@ function getQuestionText(event: ToolCallEvent): string {
 	]);
 	if (direct) return direct;
 
-	const questions = event.input.questions;
+	const questions = input.questions;
 	if (!Array.isArray(questions)) return fallback;
 
 	const labels = questions
@@ -308,23 +289,32 @@ function getQuestionText(event: ToolCallEvent): string {
 export default function (pi: ExtensionAPI) {
 	if (!isOrgmExtensionEnabled("notify")) return;
 
+	// Constructing state is safe during discovery: no probes, children or timers yet.
+	let notifier = createNotifier();
+	pi.on("session_start", () => {
+		notifier.shutdown();
+		notifier = createNotifier();
+	});
+	pi.on("session_shutdown", () => notifier.shutdown());
+
 	pi.on("tool_call", (event, ctx) => {
 		if (QUESTION_TOOL_NAMES.has(event.toolName)) {
-			notify("question", ctx, getQuestionText(event));
+			notifier.notify("question", ctx, getQuestionText(event));
 			return undefined;
 		}
 
 		if (isPermissionToolName(event.toolName)) {
-			notify("permission", ctx, getQuestionText(event));
+			notifier.notify("permission", ctx, getQuestionText(event));
 			return undefined;
 		}
 
 		return undefined;
 	});
 
-	pi.on("agent_end", (_event, ctx) => {
-		if (isSubagentRuntime()) return undefined;
-		notify("done", ctx, "Work complete.");
+	// agent_end is a low-level boundary; retries/compaction/follow-ups may continue.
+	pi.on("agent_settled", (event, ctx) => {
+		if (event.aborted || isSubagentRuntime()) return undefined;
+		notifier.notify("done", ctx, "Ready for input.");
 		return undefined;
 	});
 }
